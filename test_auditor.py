@@ -67,8 +67,8 @@ class AuditorCLITest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def audit(self, name, hw):
-        return run_cli(self.paths[name], hw)
+    def audit(self, name, hw, extra=()):
+        return run_cli(self.paths[name], hw, extra)
 
     @staticmethod
     def by_offset(res):
@@ -210,6 +210,122 @@ class AuditorCLITest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIsNone(res["deliverable"])
         self.assertTrue(any("并发" in e for e in res["errors"]))
+
+    # ------------------------------------------------ 多生产者交错事务
+    def test_interleaved_earliest_open_txn_holds_lso(self):
+        proc, res = self.audit("interleaved_commits", 5, ("--interleaved",))
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 0)
+        self.assertEqual(res["effective_limit"], 0)
+        self.assertEqual(res["deliverable"]["offsets"], [])
+        recs = self.by_offset(res)
+        self.assertIn("未决", recs[0]["reason"])
+        self.assertIn("LSO", recs[1]["reason"])
+        self.assertIn("已提交", recs[2]["reason"])
+        # pid=801 虽已提交，但 pid=800 的更早开放事务仍挡住 [0,4)
+        self.assertEqual(recs[2]["status"], "hidden")
+        self.assertIn("越过 LSO", recs[2]["reason"])
+
+    def test_interleaved_commit_after_marker_tracks_independent_txns(self):
+        proc, res = self.audit("interleaved_commits", 12, ("--interleaved",))
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertIsNone(res["lso"])
+        self.assertEqual(res["effective_limit"], 12)
+        self.assertEqual(res["deliverable"]["offsets"], [0, 1, 2, 3, 5, 9, 11])
+        recs = self.by_offset(res)
+        self.assertEqual(recs[7]["status"], "hidden")
+        self.assertIn("中止", recs[7]["reason"])
+        self.assertEqual(
+            recs[9]["txn"],
+            {"producer_id": 800, "producer_epoch": 2, "generation": 2},
+        )
+        outcomes = [
+            (
+                t["producer_id"],
+                t["producer_epoch"],
+                t["generation"],
+                t["outcome"],
+                t["record_offsets"],
+            )
+            for t in res["transactions"]
+        ]
+        self.assertEqual(
+            outcomes,
+            [
+                (800, 1, 0, "committed", [0, 5]),
+                (801, 1, 0, "committed", [2]),
+                (800, 1, 1, "aborted", [7]),
+                (800, 2, 2, "committed", [9]),
+            ],
+        )
+
+    def test_interleaved_marker_beyond_hw_does_not_decide_txn(self):
+        proc, res = self.audit("interleaved_commits", 3, ("--interleaved",))
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 0)
+        self.assertEqual(res["deliverable"]["offsets"], [])
+        by_pid = {
+            (t["producer_id"], t["producer_epoch"]): t for t in res["transactions"]
+        }
+        self.assertEqual(by_pid[(800, 1)]["outcome"], "open")
+        self.assertEqual(by_pid[(801, 1)]["outcome"], "open")
+        recs = self.by_offset(res)
+        for off in (3, 4):
+            self.assertEqual(recs[off]["status"], "unevaluated")
+
+    def test_interleaved_wrong_epoch_marker_rejected(self):
+        proc, res = self.audit("interleaved_wrong_epoch_marker", 2, ("--interleaved",))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("epoch" in e for e in res["errors"]))
+        self.assertEqual(res["transactions"][0]["outcome"], "open")
+
+    def test_interleaved_wrong_epoch_marker_beyond_hw_ignored(self):
+        proc, res = self.audit("interleaved_wrong_epoch_marker", 1, ("--interleaved",))
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 0)
+        self.assertEqual(res["effective_limit"], 0)
+        self.assertEqual(res["deliverable"]["offsets"], [])
+        self.assertEqual(res["transactions"][0]["outcome"], "open")
+        self.assertEqual(self.by_offset(res)[1]["status"], "unevaluated")
+
+    def test_interleaved_stale_epoch_data_rejected(self):
+        proc, res = self.audit("interleaved_stale_epoch_data", 3, ("--interleaved",))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("epoch" in e for e in res["errors"]))
+
+    def test_interleaved_marker_without_txn_rejected(self):
+        proc, res = self.audit("marker_without_txn", 2, ("--interleaved",))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("无对应" in e for e in res["errors"]))
+
+    def test_interleaved_marker_without_txn_beyond_hw_ignored(self):
+        proc, res = self.audit("marker_without_txn", 1, ("--interleaved",))
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["deliverable"]["offsets"], [0])
+        self.assertEqual(self.by_offset(res)[1]["status"], "unevaluated")
+
+    def test_interleaved_more_than_four_open_producers_rejected(self):
+        proc, res = self.audit("interleaved_five_producers", 5, ("--interleaved",))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("四个" in e for e in res["errors"]))
+
+    def test_default_mode_still_rejects_independent_interleaved_producers(self):
+        proc, res = self.audit("interleaved_commits", 12)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("并发" in e for e in res["errors"]))
+
+    def test_interleaved_mode_still_stops_on_corrupt_log(self):
+        proc, res = self.audit("crc_failure", 6, ("--interleaved",))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertEqual(res["scan_stop"]["reason"], "corrupt")
+        self.assertIn("CRC32C", res["scan_stop"]["detail"])
+        self.assertEqual(sorted(self.by_offset(res)), [0, 1])
 
     # ------------------------------------------------ high watermark 规则
     def test_hw_mid_batch_rejected(self):

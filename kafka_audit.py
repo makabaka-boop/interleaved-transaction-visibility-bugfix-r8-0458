@@ -593,7 +593,7 @@ def _batch_to_json(b):
 
 
 def _txn_to_json(t):
-    return {
+    result = {
         "producer_id": t["pid"],
         "producer_epoch": t["epoch"],
         "first_offset": t["first_offset"],
@@ -601,9 +601,21 @@ def _txn_to_json(t):
         "outcome": t["outcome"],
         "marker_offset": t["marker_offset"],
     }
+    if "generation" in t:
+        result["generation"] = t["generation"]
+    return result
 
 
 def _rec_to_json(batch, rec):
+    txn = None
+    if rec.txn is not None:
+        txn = {
+            "producer_id": rec.txn["pid"],
+            "producer_epoch": rec.txn["epoch"],
+        }
+        if "generation" in rec.txn:
+            txn["generation"] = rec.txn["generation"]
+
     return {
         "offset": rec.offset,
         "byte_pos": rec.byte_pos,
@@ -616,11 +628,7 @@ def _rec_to_json(batch, rec):
             {"key": k, "value": v.hex() if v is not None else None}
             for k, v in rec.headers
         ],
-        "txn": (
-            {"producer_id": rec.txn["pid"], "producer_epoch": rec.txn["epoch"]}
-            if rec.txn
-            else None
-        ),
+        "txn": txn,
         "status": rec.status,
         "reason": rec.reason,
     }
@@ -668,8 +676,9 @@ def render_text(result):
             "aborted": f"已中止 (标记 offset={t['marker_offset']})",
             "open": "未决 (无标记)",
         }[t["outcome"]]
+        generation = f" generation={t['generation']}" if "generation" in t else ""
         add(
-            f"  pid={t['producer_id']} epoch={t['producer_epoch']}  "
+            f"  pid={t['producer_id']} epoch={t['producer_epoch']}{generation}  "
             f"首条 offset={t['first_offset']}  记录 {t['record_offsets']}  -> {outcome}"
         )
 
@@ -730,7 +739,7 @@ def main(argv=None):
     ap.add_argument(
         "--interleaved",
         action="store_true",
-        help="audit up to four interleaved producers",
+        help="允许最多四个同时开放的生产者交错事务；缺省仍为单事务模式",
     )
     ap.add_argument("--json", action="store_true", help="以 JSON 输出审计结果")
     args = ap.parse_args(argv)

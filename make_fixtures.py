@@ -161,6 +161,123 @@ def build_fixtures():
         ]
     )
 
+    # 9a) 两个生产者交错；同一生产者关闭后可连续开启新事务，并可在关闭后提升 epoch
+    #     offset:
+    #       0 pid800/e1 事务开始
+    #       1 普通（pid800 未决时不得越过 LSO=0）
+    #       2 pid801/e1 事务开始
+    #       3 普通
+    #       4 pid801 COMMIT
+    #       5 pid800/e1 事务续写
+    #       6 pid800 COMMIT
+    #       7 pid800/e1 新事务（同 epoch，关闭后允许）
+    #       8 pid800 ABORT
+    #       9 pid800/e2 下一代新事务
+    #      10 pid800 COMMIT
+    #      11 普通
+    f["interleaved_commits"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="a-0")],
+                producer_id=800,
+                producer_epoch=1,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(1, [rec(0, value="normal-1")]),
+            encode_batch(
+                2,
+                [rec(0, value="b-0")],
+                producer_id=801,
+                producer_epoch=1,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(3, [rec(0, value="normal-3")]),
+            encode_control_batch(4, "commit", producer_id=801, producer_epoch=1),
+            encode_batch(
+                5,
+                [rec(0, value="a-1")],
+                producer_id=800,
+                producer_epoch=1,
+                base_sequence=1,
+                transactional=True,
+            ),
+            encode_control_batch(6, "commit", producer_id=800, producer_epoch=1),
+            encode_batch(
+                7,
+                [rec(0, value="a-aborted")],
+                producer_id=800,
+                producer_epoch=1,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(8, "abort", producer_id=800, producer_epoch=1),
+            encode_batch(
+                9,
+                [rec(0, value="a-next-generation")],
+                producer_id=800,
+                producer_epoch=2,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(10, "commit", producer_id=800, producer_epoch=2),
+            encode_batch(11, [rec(0, value="normal-11")]),
+        ]
+    )
+
+    # 9b) 结束标记 epoch 与仍开放事务不一致
+    f["interleaved_wrong_epoch_marker"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="open-e1")],
+                producer_id=802,
+                producer_epoch=1,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(1, "commit", producer_id=802, producer_epoch=2),
+        ]
+    )
+
+    # 9c) 事务关闭后 producer epoch 不得回退
+    f["interleaved_stale_epoch_data"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="e2")],
+                producer_id=803,
+                producer_epoch=2,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(1, "commit", producer_id=803, producer_epoch=2),
+            encode_batch(
+                2,
+                [rec(0, value="stale-e1")],
+                producer_id=803,
+                producer_epoch=1,
+                base_sequence=0,
+                transactional=True,
+            ),
+        ]
+    )
+
+    # 9d) 交错模式最多允许四个同时开放的事务生产者
+    f["interleaved_five_producers"] = b"".join(
+        encode_batch(
+            i,
+            [rec(0, value=f"producer-{i}")],
+            producer_id=810 + i,
+            producer_epoch=0,
+            base_sequence=0,
+            transactional=True,
+        )
+        for i in range(5)
+    )
+
     # 10) 纯普通记录（含 headers / null key / null value）
     f["clean_normal"] = b"".join(
         [
