@@ -12,7 +12,10 @@ kafka_audit.py — Kafka magic=2 RecordBatch 离线审计器 (read_committed 可
   * 控制批次 (COMMIT / ABORT 标记)，标记不暴露为业务记录
 
 判定模型 (read_committed):
-  * 至多一个同时进行的事务；其他生产者的普通记录可穿插
+  * 默认模式: 至多一个同时进行的事务；其他生产者的普通记录可穿插
+  * --interleaved 模式 (见 interleaved.py): 最多四个事务生产者交错，
+    各自至多一个开放事务，标记须匹配开放的 (pid, epoch)，
+    全局 LSO 取所有开放事务中最早的首条 offset
   * 以 (producerId, producerEpoch) 关联连续事务；epoch 错误或无对应事务的标记 -> 拒绝
   * 中止事务的记录全部隐藏；未决事务从首条记录起压住 LSO，
     其后的普通记录同样不得越过该界限提前交付
@@ -518,7 +521,9 @@ def audit(data, hw, path="<memory>", *, interleaved=False):
         if interleaved:
             from interleaved import run_transactions
 
-            lso, effective_limit = run_transactions(batches, hw, transactions, errors)
+            lso, effective_limit = run_transactions(
+                batches, hw, transactions, errors, warnings
+            )
         else:
             lso, effective_limit = _run_transactions(batches, hw, transactions, errors)
         _assign_statuses(batches, hw, effective_limit)

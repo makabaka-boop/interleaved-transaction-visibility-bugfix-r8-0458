@@ -180,6 +180,231 @@ def build_fixtures():
         ]
     )
 
+    # 11) 交错事务：两个生产者穿插，均提交
+    #     offset: 0 普通 | 1-2 事务A(pid=1000) | 3-4 事务B(pid=1001) | 5 普通 |
+    #             6 COMMIT A | 7 事务B | 8 COMMIT B | 9 普通
+    f["interleaved_commit"] = b"".join(
+        [
+            encode_batch(0, [rec(0, value="n0")]),
+            encode_batch(
+                1,
+                [rec(0, value="a0"), rec(1, value="a1")],
+                producer_id=1000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(
+                3,
+                [rec(0, value="b0"), rec(1, value="b1")],
+                producer_id=1001,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(5, [rec(0, value="n5")]),
+            encode_control_batch(6, "commit", producer_id=1000, producer_epoch=0),
+            encode_batch(
+                7,
+                [rec(0, value="b2")],
+                producer_id=1001,
+                producer_epoch=0,
+                base_sequence=2,
+                transactional=True,
+            ),
+            encode_control_batch(8, "commit", producer_id=1001, producer_epoch=0),
+            encode_batch(9, [rec(0, value="n9")]),
+        ]
+    )
+
+    # 12) 同一生产者先中止再提交新事务：连续事务必须独立，
+    #     旧事务记录不得改变归属或重新可见
+    #     offset: 0-1 事务1(pid=2000,epoch=0) | 2 ABORT |
+    #             3-4 事务2(同 pid/epoch) | 5 COMMIT | 6 普通
+    f["interleaved_abort_recommit"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="x0"), rec(1, value="x1")],
+                producer_id=2000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(2, "abort", producer_id=2000, producer_epoch=0),
+            encode_batch(
+                3,
+                [rec(0, value="y0"), rec(1, value="y1")],
+                producer_id=2000,
+                producer_epoch=0,
+                base_sequence=2,
+                transactional=True,
+            ),
+            encode_control_batch(5, "commit", producer_id=2000, producer_epoch=0),
+            encode_batch(6, [rec(0, value="n6")]),
+        ]
+    )
+
+    # 13) 关闭后 epoch 增加再开新事务（合法）
+    #     offset: 0 事务1(pid=3000,epoch=0) | 1 ABORT |
+    #             2 事务2(pid=3000,epoch=1) | 3 COMMIT(epoch=1) | 4 普通
+    f["interleaved_epoch_bump"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="e0")],
+                producer_id=3000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(1, "abort", producer_id=3000, producer_epoch=0),
+            encode_batch(
+                2,
+                [rec(0, value="e1")],
+                producer_id=3000,
+                producer_epoch=1,
+                base_sequence=1,
+                transactional=True,
+            ),
+            encode_control_batch(3, "commit", producer_id=3000, producer_epoch=1),
+            encode_batch(4, [rec(0, value="n4")]),
+        ]
+    )
+
+    # 14) 交错：标记 epoch 与开放事务不匹配 -> 拒绝
+    f["interleaved_wrong_epoch_marker"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="w0")],
+                producer_id=4000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(1, "commit", producer_id=4000, producer_epoch=1),
+        ]
+    )
+
+    # 15) 交错：标记无对应开放事务（另一生产者事务仍开放） -> 拒绝
+    f["interleaved_marker_without_txn"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="t0")],
+                producer_id=5000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(1, "commit", producer_id=5001, producer_epoch=0),
+        ]
+    )
+
+    # 16) 交错：事务开放期间 epoch 变更 -> 拒绝
+    f["interleaved_epoch_change_open"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="t0")],
+                producer_id=6000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(
+                1,
+                [rec(0, value="t1")],
+                producer_id=6000,
+                producer_epoch=1,
+                base_sequence=1,
+                transactional=True,
+            ),
+        ]
+    )
+
+    # 17) 交错：关闭后 epoch 回退 -> 拒绝
+    f["interleaved_epoch_regression"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="t0")],
+                producer_id=7000,
+                producer_epoch=1,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(1, "commit", producer_id=7000, producer_epoch=1),
+            encode_batch(
+                2,
+                [rec(0, value="t1")],
+                producer_id=7000,
+                producer_epoch=0,
+                base_sequence=1,
+                transactional=True,
+            ),
+        ]
+    )
+
+    # 18) 三个生产者穿插：一中止、一提交、一未决（LSO 由未决者压住）
+    #     offset: 0 事务A | 1 事务B | 2 事务C | 3 ABORT A | 4 COMMIT B | 5 普通
+    f["interleaved_mixed"] = b"".join(
+        [
+            encode_batch(
+                0,
+                [rec(0, value="a0")],
+                producer_id=8000,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(
+                1,
+                [rec(0, value="b0")],
+                producer_id=8001,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_batch(
+                2,
+                [rec(0, value="c0")],
+                producer_id=8002,
+                producer_epoch=0,
+                base_sequence=0,
+                transactional=True,
+            ),
+            encode_control_batch(3, "abort", producer_id=8000, producer_epoch=0),
+            encode_control_batch(4, "commit", producer_id=8001, producer_epoch=0),
+            encode_batch(5, [rec(0, value="n5")]),
+        ]
+    )
+
+    # 19) 五个事务生产者：超出交错模式前提 (<= 4)，警告但仍给出判定
+    #     offset: 0-4 各生产者一条事务记录 | 5-9 各生产者 COMMIT
+    f["interleaved_too_many_producers"] = b"".join(
+        [
+            *(
+                encode_batch(
+                    i,
+                    [rec(0, value=f"p{i}")],
+                    producer_id=9000 + i,
+                    producer_epoch=0,
+                    base_sequence=0,
+                    transactional=True,
+                )
+                for i in range(5)
+            ),
+            *(
+                encode_control_batch(
+                    5 + i, "commit", producer_id=9000 + i, producer_epoch=0
+                )
+                for i in range(5)
+            ),
+        ]
+    )
+
     return f
 
 

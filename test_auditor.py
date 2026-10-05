@@ -274,5 +274,200 @@ class AuditorCLITest(unittest.TestCase):
         self.assertIn("COMMIT", out)
 
 
+class InterleavedCLITest(unittest.TestCase):
+    """--interleaved 模式：多生产者交错事务的独立追踪与 LSO 判定。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.paths = {}
+        for name, blob in FIXTURES.items():
+            p = os.path.join(cls.tmp.name, name + ".bin")
+            with open(p, "wb") as fh:
+                fh.write(blob)
+            cls.paths[name] = p
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def audit(self, name, hw):
+        return run_cli(self.paths[name], hw, extra=("--interleaved",))
+
+    @staticmethod
+    def by_offset(res):
+        return {r["offset"]: r for r in res["records"]}
+
+    # ------------------------------------------------ 交错提交 / LSO
+    def test_interleaved_commit_full_hw(self):
+        proc, res = self.audit("interleaved_commit", 10)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        # 控制标记 (offset 6, 8) 不得进入交付列表
+        self.assertEqual(res["deliverable"]["offsets"], [0, 1, 2, 3, 4, 5, 7, 9])
+        self.assertIsNone(res["lso"])
+        self.assertEqual(res["effective_limit"], 10)
+        recs = self.by_offset(res)
+        for off in (6, 8):
+            self.assertEqual(recs[off]["kind"], "control")
+            self.assertEqual(recs[off]["status"], "hidden")
+            self.assertIn("COMMIT", recs[off]["reason"])
+        self.assertEqual(len(res["transactions"]), 2)
+        outcomes = {t["producer_id"]: t["outcome"] for t in res["transactions"]}
+        self.assertEqual(outcomes, {1000: "committed", 1001: "committed"})
+        rec_map = {t["producer_id"]: t["record_offsets"] for t in res["transactions"]}
+        self.assertEqual(rec_map[1000], [1, 2])
+        self.assertEqual(rec_map[1001], [3, 4, 7])
+
+    def test_interleaved_lso_earliest_open(self):
+        # 两个事务都未决：LSO 取最早首条 offset，其后记录不得提前交付
+        proc, res = self.audit("interleaved_commit", 6)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 1)
+        self.assertEqual(res["effective_limit"], 1)
+        self.assertEqual(res["deliverable"]["offsets"], [0])
+        recs = self.by_offset(res)
+        for off in (1, 2, 3, 4):
+            self.assertEqual(recs[off]["status"], "hidden")
+            self.assertIn("未决", recs[off]["reason"])
+        self.assertEqual(recs[5]["status"], "hidden")
+        self.assertIn("LSO", recs[5]["reason"])
+        for off in (6, 7, 8, 9):
+            self.assertEqual(recs[off]["status"], "unevaluated")
+
+    def test_interleaved_partial_commit(self):
+        # pid=1000 已提交、pid=1001 未决：LSO 压住在 3
+        proc, res = self.audit("interleaved_commit", 7)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 3)
+        self.assertEqual(res["effective_limit"], 3)
+        self.assertEqual(res["deliverable"]["offsets"], [0, 1, 2])
+        recs = self.by_offset(res)
+        self.assertEqual(recs[6]["status"], "hidden")
+        self.assertIn("COMMIT", recs[6]["reason"])
+
+    def test_interleaved_marker_beyond_hw_not_deciding(self):
+        # 提交标记在 HW 之外：事务保持未决，继续压住 LSO
+        proc, res = self.audit("interleaved_abort_recommit", 5)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 3)
+        self.assertEqual(res["effective_limit"], 3)
+        self.assertEqual(res["deliverable"]["offsets"], [])
+        recs = self.by_offset(res)
+        self.assertEqual(recs[5]["kind"], "control")
+        self.assertEqual(recs[5]["status"], "unevaluated")
+
+    # ------------------------------------------------ 连续事务独立
+    def test_interleaved_abort_then_commit(self):
+        # 同一生产者先中止再提交：旧事务记录保持隐藏，新事务独立可见
+        proc, res = self.audit("interleaved_abort_recommit", 7)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["deliverable"]["offsets"], [3, 4, 6])
+        self.assertIsNone(res["lso"])
+        recs = self.by_offset(res)
+        for off in (0, 1):
+            self.assertEqual(recs[off]["status"], "hidden")
+            self.assertIn("中止", recs[off]["reason"])
+        for off in (3, 4):
+            self.assertEqual(recs[off]["status"], "deliverable")
+            self.assertIn("已提交", recs[off]["reason"])
+        self.assertEqual(len(res["transactions"]), 2)
+        t1, t2 = res["transactions"]
+        self.assertEqual(t1["outcome"], "aborted")
+        self.assertEqual(t1["record_offsets"], [0, 1])
+        self.assertEqual(t1["marker_offset"], 2)
+        self.assertEqual(t2["outcome"], "committed")
+        self.assertEqual(t2["record_offsets"], [3, 4])
+        self.assertEqual(t2["marker_offset"], 5)
+
+    def test_interleaved_epoch_bump_after_close(self):
+        # 关闭后 epoch 增加开新事务：合法
+        proc, res = self.audit("interleaved_epoch_bump", 5)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["deliverable"]["offsets"], [2, 4])
+        recs = self.by_offset(res)
+        self.assertEqual(recs[0]["status"], "hidden")
+        self.assertIn("中止", recs[0]["reason"])
+        self.assertEqual(len(res["transactions"]), 2)
+        self.assertEqual(res["transactions"][0]["producer_epoch"], 0)
+        self.assertEqual(res["transactions"][1]["producer_epoch"], 1)
+
+    # ------------------------------------------------ 混合结局
+    def test_interleaved_mixed_outcomes(self):
+        # 一中止、一提交、一未决：LSO 由未决事务压住
+        proc, res = self.audit("interleaved_mixed", 6)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["lso"], 2)
+        self.assertEqual(res["effective_limit"], 2)
+        self.assertEqual(res["deliverable"]["offsets"], [1])
+        recs = self.by_offset(res)
+        self.assertEqual(recs[0]["status"], "hidden")
+        self.assertIn("中止", recs[0]["reason"])
+        self.assertEqual(recs[2]["status"], "hidden")
+        self.assertIn("未决", recs[2]["reason"])
+        self.assertEqual(recs[5]["status"], "hidden")
+        self.assertIn("LSO", recs[5]["reason"])
+        outcomes = {t["producer_id"]: t["outcome"] for t in res["transactions"]}
+        self.assertEqual(
+            outcomes, {8000: "aborted", 8001: "committed", 8002: "open"}
+        )
+
+    # ------------------------------------------------ 协议违规须拒绝
+    def test_interleaved_wrong_epoch_marker_rejected(self):
+        proc, res = self.audit("interleaved_wrong_epoch_marker", 2)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("epoch" in e for e in res["errors"]))
+
+    def test_interleaved_marker_without_txn_rejected(self):
+        proc, res = self.audit("interleaved_marker_without_txn", 2)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("无对应" in e for e in res["errors"]))
+
+    def test_interleaved_epoch_change_while_open_rejected(self):
+        proc, res = self.audit("interleaved_epoch_change_open", 2)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("epoch" in e for e in res["errors"]))
+
+    def test_interleaved_epoch_regression_rejected(self):
+        proc, res = self.audit("interleaved_epoch_regression", 3)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("epoch" in e for e in res["errors"]))
+
+    # ------------------------------------------------ 前提与模式边界
+    def test_interleaved_too_many_producers_warned(self):
+        proc, res = self.audit("interleaved_too_many_producers", 10)
+        self.assertEqual(proc.returncode, 0, res["errors"])
+        self.assertEqual(res["deliverable"]["offsets"], [0, 1, 2, 3, 4])
+        self.assertTrue(any("生产者" in w for w in res["warnings"]))
+
+    def test_interleaved_fixture_default_mode_unaffected(self):
+        # 同一夹具在默认单事务模式下按原规则判定：交错即并发 -> 拒绝
+        proc, res = run_cli(self.paths["interleaved_commit"], 10)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(res["deliverable"])
+        self.assertTrue(any("并发" in e for e in res["errors"]))
+
+    def test_interleaved_text_mode(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                AUDITOR,
+                self.paths["interleaved_abort_recommit"],
+                "--hw",
+                "7",
+                "--interleaved",
+            ],
+            capture_output=True,
+        )
+        out = proc.stdout.decode("utf-8")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("已中止", out)
+        self.assertIn("已提交", out)
+        self.assertIn("可交付范围", out)
+
+
 if __name__ == "__main__":
     unittest.main()
